@@ -1,17 +1,52 @@
 import { useState, useCallback, useRef } from "react";
 
 // ─── Fuzzy name matching ───────────────────────────────────────────────────
-function fuzzyNameMatch(a = "", b = "") {
+function levenshtein(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= a.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+    }
+  }
+  return matrix[a.length][b.length];
+}
+
+const isWordSimilar = (w1, w2) => {
+  if (w1 === w2) return true;
+  if (w1.length < 3 || w2.length < 3) return false;
+  const dist = levenshtein(w1, w2);
+  const maxLen = Math.max(w1.length, w2.length);
+  if (maxLen <= 4) return dist <= 1;
+  if (maxLen <= 7) return dist <= 2;
+  return dist <= 3;
+};
+
+function fuzzyNameMatch(a, b) {
   if (!a || !b) return false;
+  const strA = String(a).trim();
+  const strB = String(b).trim();
+  if (!strA || !strB) return false;
+
   const clean = s =>
-    s.toLowerCase()
-      .replace(/\b(mr|mrs|ms|dr|prof|shri|smt|late|m\/s)\b\.?/gi, "")
-      .replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-  const ca = clean(a), cb = clean(b);
+    String(s).toLowerCase()
+      .replace(/\b(mr|mrs|ms|dr|prof|shri|sri|smt|kum|late|m\/s)\b\.?/gi, "")
+      .replace(/[^a-z0-9 ]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const ca = clean(strA), cb = clean(strB);
   if (ca === cb) return true;
+  if (ca.replace(/\s+/g, "") === cb.replace(/\s+/g, "")) return true;
   if (ca.split(" ").sort().join(" ") === cb.split(" ").sort().join(" ")) return true;
-  const wa = ca.split(" "), wb = cb.split(" ");
-  return wa.filter(w => wb.includes(w)).length >= Math.min(wa.length, wb.length);
+  
+  const wa = ca.split(" ").filter(Boolean), wb = cb.split(" ").filter(Boolean);
+  if (wa.length === 0 || wb.length === 0) return false;
+  return wa.filter(w => wb.some(wbWord => isWordSimilar(w, wbWord))).length >= Math.min(wa.length, wb.length);
 }
 
 // ─── Campaign rules ────────────────────────────────────────────────────────
@@ -345,8 +380,11 @@ function runKYC(row, ocrResults = {}) {
       // Handles "Sneha S" matching "Smt. Sneha S", "Chandra Prakash" in family list etc.
       const partialMatch = (target, nameList) => {
         if (!target) return false;
-        const words = target.toLowerCase().split(" ").filter(w => w.length > 2);
-        return nameList.some(n => words.some(w => n.toLowerCase().includes(w)));
+        const words = String(target).toLowerCase().split(" ").filter(w => w.length > 2);
+        return nameList.some(n => {
+          const nWords = String(n).toLowerCase().split(" ");
+          return words.some(w => nWords.some(nw => isWordSimilar(w, nw) || nw.includes(w)));
+        });
       };
 
       const benefConfirmed = hasBenef || partialMatch(benefName, names);
