@@ -1,17 +1,55 @@
 import { useState, useCallback, useRef } from "react";
+import * as fuzzball from "fuzzball";
+import { doubleMetaphone } from "double-metaphone";
+// ─── Fuzzy name matching (Advanced NLP) ────────────────────────────────────
 
-// ─── Fuzzy name matching ───────────────────────────────────────────────────
-function fuzzyNameMatch(a = "", b = "") {
+const clean = s =>
+  String(s).toLowerCase()
+    .replace(/\b(mr|mrs|ms|dr|prof|shri|sri|smt|kum|late|m\/s)\b\.?/gi, "")
+    .replace(/[^a-z0-9 ]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+function fuzzyNameMatch(a, b) {
   if (!a || !b) return false;
-  const clean = s =>
-    s.toLowerCase()
-      .replace(/\b(mr|mrs|ms|dr|prof|shri|smt|late|m\/s)\b\.?/gi, "")
-      .replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-  const ca = clean(a), cb = clean(b);
-  if (ca === cb) return true;
-  if (ca.split(" ").sort().join(" ") === cb.split(" ").sort().join(" ")) return true;
-  const wa = ca.split(" "), wb = cb.split(" ");
-  return wa.filter(w => wb.includes(w)).length >= Math.min(wa.length, wb.length);
+  const ca = clean(a);
+  const cb = clean(b);
+  if (!ca || !cb) return false;
+
+  // 1. Exact or squashed exact match
+  if (ca === cb || ca.replace(/\s+/g, "") === cb.replace(/\s+/g, "")) return true;
+
+  // 2. Token Set Ratio (fuzzball) - handles missing middle names
+  const ratio = fuzzball.token_set_ratio(ca, cb);
+  if (ratio >= 85) return true;
+
+  // 3. Phonetic matching via Double Metaphone - handles vowel swaps
+  const metaA = ca.split(" ").map(w => doubleMetaphone(w)[0]).join("");
+  const metaB = cb.split(" ").map(w => doubleMetaphone(w)[0]).join("");
+  if (metaA && metaB && metaA === metaB && metaA.length > 2) return true;
+
+  // 4. Initial matching and Phonetic word matching
+  const wa = ca.split(" ").filter(Boolean);
+  const wb = cb.split(" ").filter(Boolean);
+  
+  if (wa.length > 0 && wb.length > 0) {
+    let matches = 0;
+    const isWordOrInitialMatch = (w1, w2) => {
+      if (w1 === w2) return true;
+      if (w1.length === 1 && w2.length > 1) return w2.startsWith(w1);
+      if (w2.length === 1 && w1.length > 1) return w1.startsWith(w2);
+      const m1 = doubleMetaphone(w1)[0], m2 = doubleMetaphone(w2)[0];
+      return m1 && m2 && m1 === m2 && m1.length > 0;
+    };
+    
+    wa.forEach(w => {
+      if (wb.some(wbWord => isWordOrInitialMatch(w, wbWord))) matches++;
+    });
+    
+    if (matches >= Math.min(wa.length, wb.length)) return true;
+  }
+
+  return false;
 }
 
 // ─── Campaign rules ────────────────────────────────────────────────────────
@@ -345,8 +383,13 @@ function runKYC(row, ocrResults = {}) {
       // Handles "Sneha S" matching "Smt. Sneha S", "Chandra Prakash" in family list etc.
       const partialMatch = (target, nameList) => {
         if (!target) return false;
-        const words = target.toLowerCase().split(" ").filter(w => w.length > 2);
-        return nameList.some(n => words.some(w => n.toLowerCase().includes(w)));
+        const targetClean = clean(target);
+        if (!targetClean) return false;
+        return nameList.some(n => {
+          const nClean = clean(n);
+          return fuzzball.token_set_ratio(targetClean, nClean) >= 85 ||
+                 fuzzball.partial_ratio(targetClean, nClean) >= 85;
+        });
       };
 
       const benefConfirmed = hasBenef || partialMatch(benefName, names);
