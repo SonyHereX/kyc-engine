@@ -1,17 +1,139 @@
 import { useState, useCallback, useRef } from "react";
+import { supabase } from "./supabaseClient";
+
+async function saveToSupabase(processedRows) {
+  try {
+    const safeParse = (str) => {
+      if (!str) return null;
+      try {
+        let cleanStr = str.trim();
+        if (cleanStr.startsWith("'") && cleanStr.endsWith("'")) {
+            cleanStr = cleanStr.slice(1, -1);
+        }
+        return JSON.parse(cleanStr);
+      } catch (e) {
+        return null;
+      }
+    };
+
+    for (const item of processedRows) {
+      const r = item.row;
+      // 1. Insert into csv_data
+      const csvPayload = {
+        project_id: String(r.project_id || ""),
+        campaign_name: r.campaign_name || "",
+        submitted_on: r.submitted_on || "",
+        category: r.category || "",
+        recipient_type: r.recipient_type || "",
+        withdrawal_bank_account_id: String(r.withdrawal_bank_account_id || ""),
+        account_status: r.account_status || "",
+        account_number: String(r.account_number || ""),
+        ifsc_code: r.ifsc_code || "",
+        bank_name: r.bank_name || "",
+        name_as_in_bank: r.name_as_in_bank || "",
+        beneficiary_name: r.beneficiary_name || "",
+        co_name: r.co_name || "",
+        is_fcra_account: r.is_fcra_account || "",
+        swift_code: r.swift_code || "",
+        relationship_with_beneficiary: r.relationship_with_beneficiary || "",
+        id_proof_link: r.id_proof_link || "",
+        id_proof_ocr_data: safeParse(r.id_proof_ocr_data),
+        relationship_proof_link: r.relationship_proof_link || "",
+        relationship_proof_ocr_data: safeParse(r.relationship_proof_ocr_data),
+        amount_raised_in_inr: parseFloat(r.amount_raised_in_inr) || 0,
+        id_proof_url: r.id_proof_url || r.id_proof_link || "",
+        account_holder_name: r.account_holder_name || r.name_as_in_bank || "",
+        relationship_type: r.relationship_type || r.relationship_with_beneficiary || "",
+        recipient_name: r.recipient_name || r.name_as_in_bank || ""
+      };
+      
+      const { data: csvData, error: csvError } = await supabase
+        .from('csv_data')
+        .insert([csvPayload])
+        .select()
+        .single();
+        
+      if (csvError) {
+        console.error("Error inserting CSV data:", csvError);
+        continue;
+      }
+
+      // 2. Insert into kyc_decisions
+      const decisionPayload = {
+        csv_data_id: csvData.id,
+        kyc_decision: item.decision,
+        rejection_reason: item.decision === "REJECT" ? item.checks.filter(c => c.status === "reject").map(c => c.detail).join(" | ") : "",
+        failed_checks: item.checks.filter(c => c.status !== "pass"),
+        action_required: item.checks.filter(c => c.status !== "pass").map(c => c.detail).join(" | ")
+      };
+
+      const { error: decError } = await supabase
+        .from('kyc_decisions')
+        .insert([decisionPayload]);
+        
+      if (decError) {
+        console.error("Error inserting KYC decision:", decError);
+      }
+    }
+    console.log("Supabase save complete!");
+  } catch (e) {
+    console.error("Supabase sync failed:", e);
+  }
+}
 
 // ─── Fuzzy name matching ───────────────────────────────────────────────────
-function fuzzyNameMatch(a = "", b = "") {
+function levenshtein(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= a.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+    }
+  }
+  return matrix[a.length][b.length];
+}
+
+const isWordSimilar = (w1, w2) => {
+  if (w1 === w2) return true;
+  
+  const shortLen = Math.min(w1.length, w2.length);
+  if (shortLen <= 2) {
+    if (w1.length > w2.length && w1.startsWith(w2)) return true;
+    if (w2.length > w1.length && w2.startsWith(w1)) return true;
+  }
+
+  if (w1.length < 3 || w2.length < 3) return false;
+  const dist = levenshtein(w1, w2);
+  const maxLen = Math.max(w1.length, w2.length);
+  if (maxLen <= 4) return dist <= 1;
+  if (maxLen <= 7) return dist <= 2;
+  return dist <= 3;
+};
+
+function fuzzyNameMatch(a, b) {
   if (!a || !b) return false;
+  const strA = String(a).trim();
+  const strB = String(b).trim();
+  if (!strA || !strB) return false;
+
   const clean = s =>
-    s.toLowerCase()
-      .replace(/\b(mr|mrs|ms|dr|prof|shri|smt|late|m\/s)\b\.?/gi, "")
-      .replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-  const ca = clean(a), cb = clean(b);
+    String(s).toLowerCase()
+      .replace(/\b(mr|mrs|ms|dr|prof|shri|sri|smt|kum|late|m\/s)\b\.?/gi, "")
+      .replace(/[^a-z0-9 ]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const ca = clean(strA), cb = clean(strB);
   if (ca === cb) return true;
   if (ca.split(" ").sort().join(" ") === cb.split(" ").sort().join(" ")) return true;
-  const wa = ca.split(" "), wb = cb.split(" ");
-  return wa.filter(w => wb.includes(w)).length >= Math.min(wa.length, wb.length);
+  
+  const wa = ca.split(" ").filter(Boolean), wb = cb.split(" ").filter(Boolean);
+  if (wa.length === 0 || wb.length === 0) return false;
+  return wa.filter(w => wb.some(wbWord => isWordSimilar(w, wbWord))).length >= Math.min(wa.length, wb.length);
 }
 
 // ─── Campaign rules ────────────────────────────────────────────────────────
@@ -345,8 +467,11 @@ function runKYC(row, ocrResults = {}) {
       // Handles "Sneha S" matching "Smt. Sneha S", "Chandra Prakash" in family list etc.
       const partialMatch = (target, nameList) => {
         if (!target) return false;
-        const words = target.toLowerCase().split(" ").filter(w => w.length > 2);
-        return nameList.some(n => words.some(w => n.toLowerCase().includes(w)));
+        const words = String(target).toLowerCase().split(" ").filter(w => w.length > 2);
+        return nameList.some(n => {
+          const nWords = String(n).toLowerCase().split(" ");
+          return words.some(w => nWords.some(nw => isWordSimilar(w, nw) || nw.includes(w)));
+        });
       };
 
       const benefConfirmed = hasBenef || partialMatch(benefName, names);
@@ -594,7 +719,7 @@ export default function KYCEngine() {
   const handleFile = useCallback((file) => {
     if (!file) return;
     const r = new FileReader();
-    r.onload = e => {
+    r.onload = async (e) => {
       const rows = parseCSV(e.target.result);
       if (rows.length) {
         // Debug: log first row's OCR fields to console
@@ -607,6 +732,15 @@ export default function KYCEngine() {
           console.log("parsed result:", parsed);
         }
         setCases(rows); setOcrStore({}); setSelected(null);
+        
+        // Calculate decisions to upload to Supabase
+        const processedRows = rows.map((row, i) => ({
+          row, index: i,
+          ocr: {},
+          ...runKYC(row, {}),
+        }));
+        
+        await saveToSupabase(processedRows);
       }
     };
     r.readAsText(file);
