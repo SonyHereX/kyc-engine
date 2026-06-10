@@ -1,20 +1,183 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { supabase } from "./supabaseClient";
+import { doubleMetaphone } from "double-metaphone";
+import jaroWinkler from "jaro-winkler";
+import stringSimilarity from "string-similarity";
 
-// ─── Fuzzy name matching ───────────────────────────────────────────────────
-function fuzzyNameMatch(a = "", b = "") {
-  if (!a || !b) return false;
-  const clean = s =>
-    s.toLowerCase()
-      .replace(/\b(mr|mrs|ms|dr|prof|shri|smt|late|m\/s)\b\.?/gi, "")
-      .replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-  const ca = clean(a), cb = clean(b);
-  if (ca === cb) return true;
-  if (ca.split(" ").sort().join(" ") === cb.split(" ").sort().join(" ")) return true;
-  const wa = ca.split(" "), wb = cb.split(" ");
-  return wa.filter(w => wb.includes(w)).length >= Math.min(wa.length, wb.length);
+async function saveToSupabase(processedRows, onError) {
+  try {
+    const safeParse = (str) => {
+      if (!str) return null;
+      try {
+        let cleanStr = str.trim();
+        if (cleanStr.startsWith("'") && cleanStr.endsWith("'")) {
+            cleanStr = cleanStr.slice(1, -1);
+        }
+        return JSON.parse(cleanStr);
+      } catch (e) {
+        return null;
+      }
+    };
+
+    for (const item of processedRows) {
+      const r = item.row;
+      // 1. Insert into csv_data
+      const csvPayload = {
+        project_id: String(r.project_id || ""),
+        campaign_name: r.campaign_name || "",
+        submitted_on: r.submitted_on || "",
+        category: r.category || "",
+        recipient_type: r.recipient_type || "",
+        withdrawal_bank_account_id: String(r.withdrawal_bank_account_id || ""),
+        account_status: r.account_status || "",
+        account_number: String(r.account_number || ""),
+        ifsc_code: r.ifsc_code || "",
+        bank_name: r.bank_name || "",
+        name_as_in_bank: r.name_as_in_bank || "",
+        beneficiary_name: r.beneficiary_name || "",
+        co_name: r.co_name || "",
+        is_fcra_account: r.is_fcra_account || "",
+        swift_code: r.swift_code || "",
+        relationship_with_beneficiary: r.relationship_with_beneficiary || "",
+        id_proof_link: r.id_proof_link || "",
+        id_proof_ocr_data: safeParse(r.id_proof_ocr_data),
+        relationship_proof_link: r.relationship_proof_link || "",
+        relationship_proof_ocr_data: safeParse(r.relationship_proof_ocr_data),
+        amount_raised_in_inr: parseFloat(r.amount_raised_in_inr) || 0,
+        id_proof_url: r.id_proof_url || r.id_proof_link || "",
+        account_holder_name: r.account_holder_name || r.name_as_in_bank || "",
+        relationship_type: r.relationship_type || r.relationship_with_beneficiary || "",
+        recipient_name: r.recipient_name || r.name_as_in_bank || ""
+      };
+      
+      const { data: csvData, error: csvError } = await supabase
+        .from('csv_data')
+        .insert([csvPayload])
+        .select()
+        .single();
+        
+      if (csvError) {
+        console.error("Error inserting CSV data:", csvError);
+        if (onError) {
+          if (csvError.code === "42501") {
+            onError("Row-Level Security (RLS) policy violation. Please disable RLS or add INSERT policies for 'csv_data' and 'kyc_decisions' in your Supabase SQL editor.");
+          } else {
+            onError(csvError.message || String(csvError));
+          }
+        }
+        continue;
+      }
+
+      // 2. Insert into kyc_decisions
+      const decisionPayload = {
+        csv_data_id: csvData.id,
+        kyc_decision: item.decision,
+        rejection_reason: item.decision === "REJECT" ? item.checks.filter(c => c.status === "reject").map(c => c.detail).join(" | ") : "",
+        failed_checks: item.checks.filter(c => c.status !== "pass"),
+        action_required: item.checks.filter(c => c.status !== "pass").map(c => c.detail).join(" | ")
+      };
+
+      const { error: decError } = await supabase
+        .from('kyc_decisions')
+        .insert([decisionPayload]);
+        
+      if (decError) {
+        console.error("Error inserting KYC decision:", decError);
+        if (onError) onError(decError.message || String(decError));
+      }
+    }
+    console.log("Supabase save complete!");
+  } catch (e) {
+    console.error("Supabase sync failed:", e);
+    if (onError) onError(e.message || String(e));
+  }
 }
 
-// ─── Campaign rules ────────────────────────────────────────────────────────
+// â”€â”€â”€ Fuzzy name matching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function levenshtein(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= a.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+    }
+  }
+  return matrix[a.length][b.length];
+}
+
+const isWordSimilar = (w1, w2) => {
+  if (w1 === w2) return true;
+  
+  const shortLen = Math.min(w1.length, w2.length);
+  if (shortLen <= 2) {
+    if (w1.length > w2.length && w1.startsWith(w2)) return true;
+    if (w2.length > w1.length && w2.startsWith(w1)) return true;
+  }
+
+  if (w1.length < 3 || w2.length < 3) return false;
+  const dist = levenshtein(w1, w2);
+  const maxLen = Math.max(w1.length, w2.length);
+  if (maxLen <= 4) return dist <= 1;
+  if (maxLen <= 7) return dist <= 2;
+  return dist <= 3;
+};
+
+function fuzzyNameMatch(a, b) {
+  if (!a || !b) return false;
+  const strA = String(a).trim();
+  const strB = String(b).trim();
+  if (!strA || !strB) return false;
+
+  const clean = s =>
+    String(s).toLowerCase()
+      .replace(/\b(mr|mrs|ms|dr|prof|shri|sri|smt|kum|late|m\/s)\b\.?/gi, "")
+      .replace(/[^a-z0-9 ]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const ca = clean(strA), cb = clean(strB);
+  if (ca === cb) return true;
+  if (ca.split(" ").sort().join(" ") === cb.split(" ").sort().join(" ")) return true;
+  
+  const caNoSpace = ca.replace(/\s/g, "");
+  const cbNoSpace = cb.replace(/\s/g, "");
+  if (caNoSpace === cbNoSpace) return true;
+  if (caNoSpace.length >= 8 && cbNoSpace.length >= 8) {
+    if (caNoSpace.includes(cbNoSpace) || cbNoSpace.includes(caNoSpace)) return true;
+  }
+
+  // --- NEW: Advanced Algorithms ---
+  
+  // 1. Double Metaphone (Phonetic matching)
+  // Check if primary or secondary phonetic codes match exactly
+  const [metaA1, metaA2] = doubleMetaphone(caNoSpace);
+  const [metaB1, metaB2] = doubleMetaphone(cbNoSpace);
+  if ((metaA1 && metaA1 === metaB1) || (metaA2 && metaA2 === metaB2) || (metaA1 && metaA1 === metaB2) || (metaA2 && metaA2 === metaB1)) {
+    return true;
+  }
+
+  // 2. Jaro-Winkler Distance (Typo detection)
+  // Distance > 0.88 is a very strong match for human names
+  const jwDist = jaroWinkler(ca, cb);
+  if (jwDist > 0.88) return true;
+
+  // 3. N-Gram Cosine Similarity (Scrambled/missing words)
+  // Dice coefficient on strings
+  const diceSimilarity = stringSimilarity.compareTwoStrings(ca, cb);
+  if (diceSimilarity > 0.80) return true;
+  
+  // --- END NEW ---
+
+  const wa = ca.split(" ").filter(Boolean), wb = cb.split(" ").filter(Boolean);
+  if (wa.length === 0 || wb.length === 0) return false;
+  return wa.filter(w => wb.some(wbWord => isWordSimilar(w, wbWord))).length >= Math.min(wa.length, wb.length);
+}
+
+// â”€â”€â”€ Campaign rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const CAMPAIGN_ALLOWED = {
   medical:                ["beneficiary","myself","family_member","treating_hospital","vendor"],
   memorial:               ["family_member","myself"],
@@ -43,7 +206,7 @@ const ORG     = ["treating_hospital","vendor","ngo","educational_institute"];
 const REL_REQ = ["family_member","treating_hospital","vendor","ngo","educational_institute"];
 const norm    = s => (s||"").toLowerCase().replace(/\s*&\s*/g,"_and_").replace(/\s*\/\s*/g,"_").replace(/[\s\-]+/g,"_").replace(/[^a-z0-9_]/g,"");
 
-// Normalise recipient type — map aliases to canonical values
+// Normalise recipient type â€” map aliases to canonical values
 function normRecipient(r = "") {
   const n = norm(r);
   const aliases = {
@@ -59,18 +222,18 @@ function normRecipient(r = "") {
   return aliases[n] || n;
 }
 
-// Parse currency field — handles "{inr,other,usd}", "INR", "USD" etc.
-// {inr,other,usd} means campaign accepts multiple currencies — treat as INR
+// Parse currency field â€” handles "{inr,other,usd}", "INR", "USD" etc.
+// {inr,other,usd} means campaign accepts multiple currencies â€” treat as INR
 // Only flag USD if currency is exclusively USD (no INR present)
 function parseCurrency(raw = "") {
   const s = raw.toLowerCase();
   const hasUSD = s.includes("usd");
   const hasINR = s.includes("inr") || s.includes("other");
   if (hasUSD && !hasINR) return "USD"; // exclusively USD
-  return "INR"; // INR or mixed — apply INR rules
+  return "INR"; // INR or mixed â€” apply INR rules
 }
 
-// ─── Parse pre-computed OCR data from CSV column ──────────────────────────
+// â”€â”€â”€ Parse pre-computed OCR data from CSV column â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Handles formats:
 //   Single:   {"name":"Ravi","document_type":"Aadhaar Card","document_id":"1234"}
 //   Multiple: {"name":"Ravi",...} , {"name":null,"side":"back",...}
@@ -80,19 +243,19 @@ function parseOcrColumn(raw = "") {
   if (!raw || raw.trim() === "") return null;
   raw = raw.trim().replace(/^'+|'+$/g, "").trim().replace(/""/g, '"');
 
-  // ── Extract ALL name-like values from anywhere in the JSON ───────────────
+  // â”€â”€ Extract ALL name-like values from anywhere in the JSON â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Handles: flat {"name":"X"}, nested {personal_details:{name:"X"}},
   // groom_details.name, bride_details.name, family_details[].name etc.
   const allNames = [];
   const addName = (n) => {
     if (!n || typeof n !== "string") return;
     // Strip titles and relationship prefixes
-    const cleaned = n.replace(/^(Sri\.?|Smt\.?|Kum\.?|Mr\.?|Mrs\.?|Dr\.?|S\/O:|W\/O:|D\/O:|B\/O:)\s*/i, "").trim();
+    const cleaned = n.replace(/^(Sri|Smt|Kum|Mr|Mrs|Dr)\b\.?\s*|^(S\/O|W\/O|D\/O|B\/O):\s*/i, "").trim();
     if (cleaned && cleaned !== "null" && cleaned.length > 1) allNames.push(cleaned);
   };
 
   // Regex: find all "name": "value" or "name_before_marriage": "value" etc.
-  const nameKeys = ["name","name_before_marriage","name_after_marriage","full_name"];
+  const nameKeys = ["name","name_before_marriage","name_after_marriage","full_name","father_name","mother_name","husband_name","parent_name","beneficiary_name","recipient_name"];
   for (const key of nameKeys) {
     const re = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, "g");
     for (const m of raw.matchAll(re)) addName(m[1]);
@@ -106,7 +269,7 @@ function parseOcrColumn(raw = "") {
   // Dedupe preserving order
   const uniqueNames = [...new Map(allNames.map(n => [n.toLowerCase(), n])).values()];
 
-  // ── Try to parse full JSON for structured fields ─────────────────────────
+  // â”€â”€ Try to parse full JSON for structured fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   let docType = null, docNumber = null;
   try {
     // Try parsing as a single JSON object (new rich OCR format)
@@ -132,11 +295,43 @@ function parseOcrColumn(raw = "") {
   };
 }
 
-// ─── KYC Engine ────────────────────────────────────────────────────────────
-function runKYC(row, ocrResults = {}) {
+// â”€â”€â”€ KYC Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function runKYC(row, ocrResults = {}, llmCache = {}) {
   const checks = [];
   let decision = "APPROVE";
   const flag = lvl => { if (lvl==="REJECT") decision="REJECT"; else if (lvl==="HOLD" && decision!=="REJECT") decision="HOLD"; };
+
+  const checkName = (a, b) => {
+    if (!a || !b) return { match: false, explain: "" };
+    if (fuzzyNameMatch(a, b)) return { match: true, explain: "" };
+    const cleanA = String(a).trim();
+    const cleanB = String(b).trim();
+    const key1 = `${cleanA}||${cleanB}`;
+    const key2 = `${cleanB}||${cleanA}`;
+    const cached = llmCache && (llmCache[key1] || llmCache[key2]);
+    if (cached?.match) {
+      return { match: true, explain: " (AI Verified)" };
+    }
+    if (cached && !cached.match && !cached.loading) {
+      return { match: false, explain: ` (AI Mismatch: ${cached.reason})` };
+    }
+    if (cached?.loading) {
+      return { match: false, explain: " (AI Verifying...)" };
+    }
+    return { match: false, explain: "" };
+  };
+
+  const flagNameMismatch = (a, b) => {
+    const key1 = `${String(a).trim()}||${String(b).trim()}`;
+    const key2 = `${String(b).trim()}||${String(a).trim()}`;
+    const cached = llmCache && (llmCache[key1] || llmCache[key2]);
+    if (cached?.loading) {
+      flag("HOLD");
+      return "hold";
+    }
+    flag("REJECT");
+    return "reject";
+  };
 
   const rt         = normRecipient(row.recipient_type||"");
   const cat        = norm(row.category||"");
@@ -147,7 +342,7 @@ function runKYC(row, ocrResults = {}) {
   const nameBank   = (row.name_as_in_bank||"").trim();
   const nameUser   = (row.account_holder_name||row.name_entered_by_user||"").trim();
   const panStatus  = (row.pan_status||"").toUpperCase();
-  // pan_card_number in CSV means PAN was submitted — treat as VALID if present
+  // pan_card_number in CSV means PAN was submitted â€” treat as VALID if present
   const panNumber  = (row.pan_card_number||"").trim();
   const panName    = (row.pan_name||"").trim();
   const recipName  = (row.recipient_name||"").trim();
@@ -159,7 +354,7 @@ function runKYC(row, ocrResults = {}) {
   const isIndiv    = INDIV.includes(rt);
 
   // OCR results
-  // Column name aliases — support both naming conventions from real CSV
+  // Column name aliases â€” support both naming conventions from real CSV
   if (!row.id_proof_url && row.id_proof_link)             row.id_proof_url = row.id_proof_link;
   if (!row.relationship_proof_url && row.relationship_proof_link) row.relationship_proof_url = row.relationship_proof_link;
   if (!row.account_holder_name && row.name_as_in_bank)    row.account_holder_name = row.name_as_in_bank;
@@ -187,11 +382,12 @@ function runKYC(row, ocrResults = {}) {
 
   // 2. Name Match
   if (nameBank && nameUser) {
-    if (fuzzyNameMatch(nameBank, nameUser)) {
-      checks.push({ id:"name", label:"Name Match (Bank vs User)", status:"pass", detail:`"${nameUser}" matches bank record "${nameBank}".` });
+    const res = checkName(nameBank, nameUser);
+    if (res.match) {
+      checks.push({ id:"name", label:"Name Match (Bank vs User)", status:"pass", detail:`"${nameUser}" matches bank record "${nameBank}"${res.explain}.` });
     } else {
-      checks.push({ id:"name", label:"Name Match (Bank vs User)", status:"reject", detail:`Mismatch — user entered "${nameUser}", bank shows "${nameBank}". Update the bank account name.` });
-      flag("REJECT");
+      const status = flagNameMismatch(nameBank, nameUser);
+      checks.push({ id:"name", label:"Name Match (Bank vs User)", status, detail:`Mismatch â€” user entered "${nameUser}", bank shows "${nameBank}"${res.explain}. Update the bank account name.` });
     }
   } else {
     checks.push({ id:"name", label:"Name Match (Bank vs User)", status:"hold", detail:"Bank name or user-entered name missing. Manual verification required." });
@@ -201,13 +397,14 @@ function runKYC(row, ocrResults = {}) {
   // 2b. Beneficiary name vs bank name (for beneficiary recipient type)
   // The account must belong to the actual beneficiary
   if (rt === "beneficiary" && nameBank && benefName) {
-    if (fuzzyNameMatch(nameBank, benefName)) {
+    const res = checkName(nameBank, benefName);
+    if (res.match) {
       checks.push({ id:"benef_name", label:"Beneficiary Name vs Bank Account", status:"pass",
-        detail:`Bank account holder "${nameBank}" matches beneficiary "${benefName}".` });
+        detail:`Bank account holder "${nameBank}" matches beneficiary "${benefName}"${res.explain}.` });
     } else {
-      checks.push({ id:"benef_name", label:"Beneficiary Name vs Bank Account", status:"reject",
-        detail:`Account holder "${nameBank}" does not match beneficiary "${benefName}". For beneficiary recipient type, the beneficiary's own account must be added.` });
-      flag("REJECT");
+      const status = flagNameMismatch(nameBank, benefName);
+      checks.push({ id:"benef_name", label:"Beneficiary Name vs Bank Account", status,
+        detail:`Account holder "${nameBank}" does not match beneficiary "${benefName}"${res.explain}. For beneficiary recipient type, the beneficiary's own account must be added.` });
     }
   }
 
@@ -225,21 +422,38 @@ function runKYC(row, ocrResults = {}) {
     flag("HOLD");
   }
 
-  // 4. Myself — CO name match
+  // 4. Myself â€” CO name match
   if (rt === "myself") {
     if (coName && (nameUser||nameBank)) {
-      // co_name may be a username/handle — only flag mismatch if it looks like a real name
+      // co_name may be a username/handle â€” only flag mismatch if it looks like a real name
       // A real name has letters and spaces but no digits/underscores dominating
       const looksLikeName = (s) => /^[a-zA-Z\s\.]{4,}$/.test(s.trim());
       if (!looksLikeName(coName)) {
-        // co_name is a username/handle — can't reliably match, pass to manual
+        // co_name is a username/handle â€” can't reliably match, pass to manual
         checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"hold", detail:`CO identifier "${coName}" appears to be a username, not a name. Manual verification of account ownership required.` });
         flag("HOLD");
-      } else if (fuzzyNameMatch(coName,nameUser)||fuzzyNameMatch(coName,nameBank)) {
-        checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"pass", detail:`Account holder matches Campaign Organiser "${coName}".` });
       } else {
-        checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"reject", detail:`Recipient type is "myself" but account name "${nameUser||nameBank}" doesn't match CO "${coName}".` });
-        flag("REJECT");
+        const resUser = checkName(coName, nameUser);
+        const resBank = checkName(coName, nameBank);
+        if (resUser.match || resBank.match) {
+          const explain = resUser.match ? resUser.explain : resBank.explain;
+          checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"pass", detail:`Account holder matches Campaign Organiser "${coName}"${explain}.` });
+        } else {
+          // If either is loading, treat as loading (HOLD)
+          const keyUser1 = `${coName.trim()}||${nameUser.trim()}`;
+          const keyUser2 = `${nameUser.trim()}||${coName.trim()}`;
+          const keyBank1 = `${coName.trim()}||${nameBank.trim()}`;
+          const keyBank2 = `${nameBank.trim()}||${coName.trim()}`;
+          const loading = llmCache && (llmCache[keyUser1]?.loading || llmCache[keyUser2]?.loading || llmCache[keyBank1]?.loading || llmCache[keyBank2]?.loading);
+          const explain = resUser.explain || resBank.explain;
+          if (loading) {
+            checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"hold", detail:`Recipient type is "myself" but account name "${nameUser||nameBank}" doesn't match CO "${coName}"${explain}.` });
+            flag("HOLD");
+          } else {
+            checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"reject", detail:`Recipient type is "myself" but account name "${nameUser||nameBank}" doesn't match CO "${coName}"${explain}.` });
+            flag("REJECT");
+          }
+        }
       }
     } else {
       checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"hold", detail:"CO name unavailable to verify 'myself' recipient. Manual check needed." });
@@ -247,7 +461,7 @@ function runKYC(row, ocrResults = {}) {
     }
   }
 
-  // 5. ID Proof — Individual (with OCR)
+  // 5. ID Proof â€” Individual (with OCR)
   if (isIndiv) {
     const idUrl = row.id_proof_url || row.id_proof_1_url || "";
     if (!idUrl && !idOCR) {
@@ -258,18 +472,34 @@ function runKYC(row, ocrResults = {}) {
       flag("HOLD");
     } else if (idOCR?.full_name) {
       const nameToCheck = rt==="myself" ? (coName||nameUser) : (recipName||nameUser);
-      const idMatch     = fuzzyNameMatch(idOCR.full_name, nameToCheck);
-      const benMatch    = benefName && fuzzyNameMatch(idOCR.full_name, benefName);
-      if (idMatch || benMatch) {
+      const resMatch = checkName(idOCR.full_name, nameToCheck);
+      const resBenMatch = benefName ? checkName(idOCR.full_name, benefName) : { match: false, explain: "" };
+      
+      if (resMatch.match || resBenMatch.match) {
+        const explain = resMatch.match ? resMatch.explain : resBenMatch.explain;
         checks.push({ id:"id", label:"ID Proof (Individual)", status:"pass",
-          detail:`${idOCR.document_type||"Document"}${idOCR.document_number?` (${idOCR.document_number})`:""}. Extracted name "${idOCR.full_name}" matches recipient/beneficiary.` });
+          detail:`${idOCR.document_type||"Document"}${idOCR.document_number?` (${idOCR.document_number})`:""}. Extracted name "${idOCR.full_name}" matches recipient/beneficiary${explain}.` });
       } else {
-        checks.push({ id:"id", label:"ID Proof (Individual)", status:"reject",
-          detail:`Extracted name "${idOCR.full_name}" doesn't match recipient "${nameToCheck}" or beneficiary "${benefName}". Align the recipient name with the document.` });
-        flag("REJECT");
+        // If either is loading, treat as hold
+        const keyMatch1 = `${idOCR.full_name.trim()}||${nameToCheck.trim()}`;
+        const keyMatch2 = `${nameToCheck.trim()}||${idOCR.full_name.trim()}`;
+        const keyBen1 = benefName ? `${idOCR.full_name.trim()}||${benefName.trim()}` : "";
+        const keyBen2 = benefName ? `${benefName.trim()}||${idOCR.full_name.trim()}` : "";
+        const loading = llmCache && (llmCache[keyMatch1]?.loading || llmCache[keyMatch2]?.loading || (benefName && (llmCache[keyBen1]?.loading || llmCache[keyBen2]?.loading)));
+        const explain = resMatch.explain || resBenMatch.explain;
+        
+        if (loading) {
+          checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold",
+            detail:`Extracted name "${idOCR.full_name}" doesn't match recipient "${nameToCheck}" or beneficiary "${benefName}"${explain}. Align the recipient name with the document.` });
+          flag("HOLD");
+        } else {
+          checks.push({ id:"id", label:"ID Proof (Individual)", status:"reject",
+            detail:`Extracted name "${idOCR.full_name}" doesn't match recipient "${nameToCheck}" or beneficiary "${benefName}"${explain}. Align the recipient name with the document.` });
+          flag("REJECT");
+        }
       }
     } else if (idOCR) {
-      // OCR ran but no name extracted — document may be valid, check doc number at least
+      // OCR ran but no name extracted â€” document may be valid, check doc number at least
       const docNum = idOCR.document_number || "";
       checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold",
         detail:`ID document present${docNum ? ` (${idOCR.document_type||"Doc"}: ${docNum})` : ""} but name could not be extracted. Manual name verification required.` });
@@ -280,7 +510,7 @@ function runKYC(row, ocrResults = {}) {
     }
   }
 
-  // 6. PAN — Org
+  // 6. PAN â€” Org
   if (isOrg) {
     // PAN is considered submitted if: pan_card_number column has value, or pan_status set, or OCR extracted it
     const panSubmitted = panNumber || panStatus || idOCR?.pan_number;
@@ -294,22 +524,23 @@ function runKYC(row, ocrResults = {}) {
       const panNameToUse = idOCR?.full_name || panName;
       const panNum = idOCR?.pan_number || panNumber;
       if (panNameToUse && recipName) {
-        if (fuzzyNameMatch(panNameToUse, recipName)) {
+        const res = checkName(panNameToUse, recipName);
+        if (res.match) {
           checks.push({ id:"pan", label:"PAN Verification (Org)", status:"pass",
-            detail:`PAN${panNum ? ` (${panNum})` : ""} — name "${panNameToUse}" matches recipient "${recipName}".` });
+            detail:`PAN${panNum ? ` (${panNum})` : ""} â€” name "${panNameToUse}" matches recipient "${recipName}"${res.explain}.` });
         } else {
-          checks.push({ id:"pan", label:"PAN Verification (Org)", status:"reject",
-            detail:`PAN name "${panNameToUse}" doesn't match recipient "${recipName}". Update hospital/vendor name.` });
-          flag("REJECT");
+          const status = flagNameMismatch(panNameToUse, recipName);
+          checks.push({ id:"pan", label:"PAN Verification (Org)", status,
+            detail:`PAN name "${panNameToUse}" doesn't match recipient "${recipName}"${res.explain}. Update hospital/vendor name.` });
         }
       } else {
         checks.push({ id:"pan", label:"PAN Verification (Org)", status:"pass",
-          detail:`PAN submitted${panNum ? ` (${panNum})` : ""}. Name verification skipped — no PAN name available for matching.` });
+          detail:`PAN submitted${panNum ? ` (${panNum})` : ""}. Name verification skipped â€” no PAN name available for matching.` });
       }
     }
   }
 
-  // 7. GST — Vendor
+  // 7. GST â€” Vendor
   // gstin_valid column: "true"/"1"/true = valid. Also check gst_status.
   const gstinValid = (row.gstin_valid||"").toLowerCase();
   const gstIsValid = gstStatus === "VALID" || gstinValid === "true" || gstinValid === "1";
@@ -337,32 +568,64 @@ function runKYC(row, ocrResults = {}) {
     } else if (relOCR?.names_found) {
       const names = relOCR.names_found || [];
 
-      // Exact fuzzy match
-      const hasBenef = benefName && names.some(n => fuzzyNameMatch(n, benefName));
-      const hasRecip = recipName && names.some(n => fuzzyNameMatch(n, recipName));
+      // Helper for list match
+      const checkInList = (target, nameList) => {
+        if (!target) return { match: false, explain: "" };
+        const matched = nameList.find(n => fuzzyNameMatch(n, target));
+        if (matched) return { match: true, explain: "" };
+        
+        for (const n of nameList) {
+          const res = checkName(n, target);
+          if (res.match) return { match: true, explain: res.explain };
+        }
 
-      // Partial match — any significant word from the name appears in any extracted name
+        const loading = nameList.some(n => {
+          const key1 = `${n.trim()}||${target.trim()}`;
+          const key2 = `${target.trim()}||${n.trim()}`;
+          return llmCache && (llmCache[key1]?.loading || llmCache[key2]?.loading);
+        });
+
+        if (loading) {
+          return { match: false, explain: " (AI Verifying...)", loading: true };
+        }
+
+        return { match: false, explain: "" };
+      };
+
+      // Partial match â€” any significant word from the name appears in any extracted name
       // Handles "Sneha S" matching "Smt. Sneha S", "Chandra Prakash" in family list etc.
       const partialMatch = (target, nameList) => {
         if (!target) return false;
-        const words = target.toLowerCase().split(" ").filter(w => w.length > 2);
-        return nameList.some(n => words.some(w => n.toLowerCase().includes(w)));
+        const words = String(target).toLowerCase().split(" ").filter(w => w.length > 2);
+        return nameList.some(n => {
+          const nWords = String(n).toLowerCase().split(" ");
+          return words.some(w => nWords.some(nw => isWordSimilar(w, nw) || nw.includes(w)));
+        });
       };
 
-      const benefConfirmed = hasBenef || partialMatch(benefName, names);
-      const recipConfirmed = hasRecip || partialMatch(recipName, names);
+      const benefRes = checkInList(benefName, names);
+      const benefConfirmed = benefRes.match || partialMatch(benefName, names);
+      
+      const recipRes = checkInList(recipName, names);
+      const recipConfirmed = recipRes.match || partialMatch(recipName, names);
+
+      const explain = (benefRes.explain || recipRes.explain) || "";
 
       if (benefConfirmed && recipConfirmed) {
         checks.push({ id:"rel", label:"Relationship Proof", status:"pass",
-          detail:`${relOCR.document_type||"Document"} — both "${benefName}" and "${recipName}" confirmed. Relationship established.` });
+          detail:`${relOCR.document_type||"Document"} â€” both "${benefName}" and "${recipName}" confirmed${explain}. Relationship established.` });
+      } else if (benefRes.loading || recipRes.loading) {
+        checks.push({ id:"rel", label:"Relationship Proof", status:"hold",
+          detail:`Verifying relationship proof names with AI...${explain}` });
+        flag("HOLD");
       } else if (!benefConfirmed && !recipConfirmed) {
         checks.push({ id:"rel", label:"Relationship Proof", status:"reject",
-          detail:`Neither beneficiary "${benefName}" nor recipient "${recipName}" found in document. Names found: ${names.join(", ")||"none"}.` });
+          detail:`Neither beneficiary "${benefName}" nor recipient "${recipName}" found in document${explain}. Names found: ${names.join(", ")||"none"}.` });
         flag("REJECT");
       } else {
         const missing = !benefConfirmed ? `beneficiary "${benefName}"` : `recipient "${recipName}"`;
         checks.push({ id:"rel", label:"Relationship Proof", status:"reject",
-          detail:`Could not confirm ${missing} in relationship document. Names found: ${names.join(", ")||"none"}.` });
+          detail:`Could not confirm ${missing} in relationship document${explain}. Names found: ${names.join(", ")||"none"}.` });
         flag("REJECT");
       }
     } else if (relOCR) {
@@ -384,7 +647,7 @@ function runKYC(row, ocrResults = {}) {
       flag("REJECT");
     } else if (!isFCRA && rt==="vendor") {
       if (gstStatus==="VALID") {
-        checks.push({ id:"fcra", label:"USD / FCRA Compliance (Vendor)", status:"pass", detail:"Vendor is GST registered — USD transfer permitted." });
+        checks.push({ id:"fcra", label:"USD / FCRA Compliance (Vendor)", status:"pass", detail:"Vendor is GST registered â€” USD transfer permitted." });
       } else {
         checks.push({ id:"fcra", label:"USD / FCRA Compliance (Vendor)", status:"reject", detail:"Foreign donations to vendor accounts require GST registration. GST not verified." });
         flag("REJECT");
@@ -398,7 +661,7 @@ function runKYC(row, ocrResults = {}) {
         flag("HOLD");
       }
     } else {
-      checks.push({ id:"fcra", label:"USD / FCRA Compliance", status:"hold", detail:"USD transfer requested — FCRA status unclear. Manual verification required." });
+      checks.push({ id:"fcra", label:"USD / FCRA Compliance", status:"hold", detail:"USD transfer requested â€” FCRA status unclear. Manual verification required." });
       flag("HOLD");
     }
   }
@@ -406,11 +669,14 @@ function runKYC(row, ocrResults = {}) {
   // 10. NGO same-entity
   if (rt==="ngo") {
     const cNGO = (row.campaign_ngo_name||"").trim();
-    if (cNGO && recipName && !fuzzyNameMatch(cNGO,recipName)) {
-      checks.push({ id:"ngo", label:"NGO Same-Entity Rule", status:"reject", detail:`Campaign is for "${cNGO}" but funds directed to "${recipName}". Funds must go to the same NGO.` });
-      flag("REJECT");
-    } else if (cNGO) {
-      checks.push({ id:"ngo", label:"NGO Same-Entity Rule", status:"pass", detail:"Campaign NGO and recipient NGO match." });
+    if (cNGO && recipName) {
+      const res = checkName(cNGO, recipName);
+      if (res.match) {
+        checks.push({ id:"ngo", label:"NGO Same-Entity Rule", status:"pass", detail:`Campaign NGO and recipient NGO match${res.explain}.` });
+      } else {
+        const status = flagNameMismatch(cNGO, recipName);
+        checks.push({ id:"ngo", label:"NGO Same-Entity Rule", status, detail:`Campaign is for "${cNGO}" but funds directed to "${recipName}"${res.explain}. Funds must go to the same NGO.` });
+      }
     }
   }
 
@@ -431,7 +697,7 @@ function runKYC(row, ocrResults = {}) {
   return { checks, decision };
 }
 
-// ─── CSV Parser (RFC 4180 compliant — handles multi-line quoted fields) ───
+// â”€â”€â”€ CSV Parser (RFC 4180 compliant â€” handles multi-line quoted fields) â”€â”€â”€
 // Multi-line JSON in cells (e.g. relationship_proof_ocr_data) is handled correctly
 function parseCSV(text) {
   // Normalize line endings
@@ -497,11 +763,11 @@ function parseCSV(text) {
     });
 }
 
-// ─── Design tokens ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Design tokens â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const SC = {
-  pass:   { color:"#34d399", bg:"#022c1e", label:"PASS", icon:"✓" },
-  reject: { color:"#f87171", bg:"#200808", label:"FAIL", icon:"✗" },
-  hold:   { color:"#fbbf24", bg:"#1e1506", label:"HOLD", icon:"◐" },
+  pass:   { color:"#34d399", bg:"#022c1e", label:"PASS", icon:"âœ“" },
+  reject: { color:"#f87171", bg:"#200808", label:"FAIL", icon:"âœ—" },
+  hold:   { color:"#fbbf24", bg:"#1e1506", label:"HOLD", icon:"â—" },
 };
 const DC = {
   APPROVE: { color:"#34d399", bg:"#011a10", border:"#065f46", label:"AUTO APPROVE" },
@@ -509,7 +775,7 @@ const DC = {
   HOLD:    { color:"#fbbf24", bg:"#1e1506", border:"#92400e", label:"HOLD FOR REVIEW" },
 };
 
-// ─── UI Components ─────────────────────────────────────────────────────────
+// â”€â”€â”€ UI Components â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function Pill({ status }) {
   const c = SC[status];
   return <span style={{ display:"inline-flex", alignItems:"center", gap:4, background:c.bg, color:c.color, border:`1px solid ${c.color}35`, borderRadius:3, padding:"1px 7px", fontSize:10, fontWeight:700, letterSpacing:"0.06em", fontFamily:"monospace" }}>{c.icon} {c.label}</span>;
@@ -528,7 +794,7 @@ function CheckRow({ check }) {
         <span style={{ color:c.color, fontSize:11, width:14, textAlign:"center", fontWeight:800 }}>{c.icon}</span>
         <span style={{ flex:1, fontSize:11.5, color:"#cbd5e1", fontFamily:"monospace" }}>{check.label}</span>
         <Pill status={check.status} />
-        <span style={{ color:"#2d3a50", fontSize:10, marginLeft:2 }}>{open?"▲":"▼"}</span>
+        <span style={{ color:"#2d3a50", fontSize:10, marginLeft:2 }}>{open?"â–²":"â–¼"}</span>
       </div>
       {open && <div style={{ padding:"2px 16px 10px 40px", fontSize:11, color:"#64748b", lineHeight:1.7 }}>{check.detail}</div>}
     </div>
@@ -545,12 +811,12 @@ function CaseCard({ row, decision, isSelected, onSelect }) {
         </span>
         <DPill decision={decision} />
       </div>
-      <div style={{ fontSize:10, color:"#374151" }}>{row.category||"—"} · {row.recipient_type||"—"}</div>
+      <div style={{ fontSize:10, color:"#374151" }}>{row.category||"â€”"} Â· {row.recipient_type||"â€”"}</div>
     </div>
   );
 }
 
-// ─── Demo data ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ Demo data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const DEMO = [
   { campaign_name:"support-bhagyavathi-duriseati", category:"Medical", recipient_type:"vendor", account_number:"23030200002897", ifsc_code:"FDRL0002303", bank_name:"Federal Bank", name_entered_by_user:"SRI JOSHNAV MEDICAL AND SURGICALS", name_as_in_bank:"SRI JOSHNAV MEDICAL AND SURGICALS", account_status:"VERIFIED", beneficiary_name:"Bhagyavathi Duriseati", recipient_name:"DURGYALA SHRAVAN", co_name:"Durgyala Shravan", currency:"INR", pan_status:"VALID", pan_name:"DURGYALA SHRAVAN", gst_status:"VALID", is_fcra_account:"No", relationship_proof_present:"yes", relationship_beneficiary_name_match:"yes", relationship_recipient_name_match:"yes", vendor_category:"medical surgical", id_proof_url:"", relationship_proof_url:"" },
   { campaign_name:"support-stray-animals-967", category:"Animals", recipient_type:"myself", account_number:"20266929280", ifsc_code:"SBIN0016332", bank_name:"State Bank of India", name_entered_by_user:"Samira Fernandez", name_as_in_bank:"MRS SAMIRA FERNANDEZ", account_status:"VERIFIED", beneficiary_name:"Stray Animals", recipient_name:"Samira Fernandez", co_name:"Samira Fernandez", currency:"INR", is_fcra_account:"No", id_proof_url:"", id_proof_type:"Passport" },
@@ -559,7 +825,96 @@ const DEMO = [
   { campaign_name:"support-animals-10020-vendor-mismatch", category:"Animals", recipient_type:"vendor", account_number:"9988776655", ifsc_code:"AXIS0001234", bank_name:"Axis Bank", name_entered_by_user:"Sunrise School Supplies", name_as_in_bank:"SUNRISE SCHOOL SUPPLIES", account_status:"VERIFIED", beneficiary_name:"Stray Dogs NGO", recipient_name:"Sunrise School Supplies", co_name:"Ravi Kumar", currency:"INR", pan_status:"VALID", pan_name:"SUNRISE SCHOOL SUPPLIES", gst_status:"VALID", is_fcra_account:"No", vendor_category:"school stationery", id_proof_url:"", relationship_proof_url:"" },
 ];
 
-// ─── Main App ───────────────────────────────────────────────────────────────
+// â”€â”€â”€ Asynchronous AI Name Match & Supabase Sync â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function verifyNameWithClaude(nameA, nameB) {
+  try {
+    const res = await fetch("/api/claude", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: `You are a KYC name verification system. Analyze if these two names refer to the same person, allowing for common spelling variations (like Kathrina vs Kathreena), initials expansion (like K vs Kumar/Kavita), missing middle names/surnames, titles, and regional formats.
+Return ONLY valid JSON (no markdown formatting, no codeblocks):
+{
+  "match": true/false,
+  "reason": "short explanation of the decision"
+}
+
+Name 1: "${nameA}"
+Name 2: "${nameB}"`
+              }
+            ]
+          }
+        ]
+      })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const text = data.content[0].text;
+    
+    let cleanText = text.trim();
+    if (cleanText.startsWith("```json")) {
+      cleanText = cleanText.substring(7);
+    }
+    if (cleanText.startsWith("```")) {
+      cleanText = cleanText.substring(3);
+    }
+    if (cleanText.endsWith("```")) {
+      cleanText = cleanText.substring(0, cleanText.length - 3);
+    }
+    cleanText = cleanText.trim();
+    
+    return JSON.parse(cleanText);
+  } catch (err) {
+    console.error("verifyNameWithClaude error:", err);
+    return { match: false, reason: err.message };
+  }
+}
+
+async function updateCaseInSupabase(row, decision, checks) {
+  try {
+    const { data: csvData, error: csvError } = await supabase
+      .from('csv_data')
+      .select('id')
+      .eq('project_id', String(row.project_id || ""))
+      .limit(1)
+      .single();
+      
+    if (csvError || !csvData) {
+      console.error("Could not find csv_data record to update:", csvError);
+      return;
+    }
+
+    const decisionPayload = {
+      kyc_decision: decision,
+      rejection_reason: decision === "REJECT" ? checks.filter(c => c.status === "reject").map(c => c.detail).join(" | ") : "",
+      failed_checks: checks.filter(c => c.status !== "pass"),
+      action_required: checks.filter(c => c.status !== "pass").map(c => c.detail).join(" | ")
+    };
+
+    const { error: decError } = await supabase
+      .from('kyc_decisions')
+      .update(decisionPayload)
+      .eq('csv_data_id', csvData.id);
+      
+    if (decError) {
+      console.error("Error updating KYC decision in Supabase:", decError);
+    } else {
+      console.log(`Updated decision for project ${row.project_id} to ${decision} in Supabase`);
+    }
+  } catch (e) {
+    console.error("Failed to sync updated decision to Supabase:", e);
+  }
+}
+
+// â”€â”€â”€ Main App â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export default function KYCEngine() {
   const [cases, setCases]         = useState([]);
   const [ocrStore, setOcrStore]   = useState({});      // { rowIndex: { id_proof, rel_proof } }
@@ -570,6 +925,8 @@ export default function KYCEngine() {
   const fileRef = useRef();
   const abortRef = useRef(false);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [llmCache, setLlmCache]   = useState({});      // { "nameA||nameB": { loading, match, reason } }
+  const [dbError, setDbError]     = useState(null);
 
 
   // Run checks for all cases with pause support
@@ -594,7 +951,7 @@ export default function KYCEngine() {
   const handleFile = useCallback((file) => {
     if (!file) return;
     const r = new FileReader();
-    r.onload = e => {
+    r.onload = async (e) => {
       const rows = parseCSV(e.target.result);
       if (rows.length) {
         // Debug: log first row's OCR fields to console
@@ -607,6 +964,16 @@ export default function KYCEngine() {
           console.log("parsed result:", parsed);
         }
         setCases(rows); setOcrStore({}); setSelected(null);
+        setDbError(null);
+        
+        // Calculate decisions to upload to Supabase
+        const processedRows = rows.map((row, i) => ({
+          row, index: i,
+          ocr: {},
+          ...runKYC(row, {}, {}),
+        }));
+        
+        await saveToSupabase(processedRows, setDbError);
       }
     };
     r.readAsText(file);
@@ -616,8 +983,108 @@ export default function KYCEngine() {
   const processed = cases.map((row, i) => ({
     row, index: i,
     ocr: ocrStore[i] || {},
-    ...runKYC(row, ocrStore[i] || {}),
+    ...runKYC(row, ocrStore[i] || {}, llmCache),
   }));
+
+  // Auto-trigger LLM verification for selected case
+  useEffect(() => {
+    if (selected === null || !processed[selected]) return;
+    const sel = processed[selected];
+    
+    const pairsToVerify = [];
+    const addPair = (a, b) => {
+      if (!a || !b) return;
+      const cleanA = String(a).trim();
+      const cleanB = String(b).trim();
+      if (!cleanA || !cleanB) return;
+      if (fuzzyNameMatch(cleanA, cleanB)) return;
+      const key = `${cleanA}||${cleanB}`;
+      if (llmCache[key]) return; // already in cache or loading
+      pairsToVerify.push([cleanA, cleanB]);
+    };
+
+    const r = sel.row;
+    const rt         = normRecipient(r.recipient_type||"");
+    const isIndiv    = INDIV.includes(rt);
+    const isOrg      = ORG.includes(rt);
+    const nameBank   = (r.name_as_in_bank||"").trim();
+    const nameUser   = (r.account_holder_name||r.name_entered_by_user||"").trim();
+    const benefName  = (r.beneficiary_name||"").trim();
+    const coName     = (r.co_name||"").trim();
+    const recipName  = (r.recipient_name||"").trim();
+    
+    const idOCR  = (r.id_proof_ocr_data   ? parseOcrColumn(r.id_proof_ocr_data)           : null)
+                || sel.ocr?.id_proof  || null;
+    const relOCR = (r.relationship_proof_ocr_data ? parseOcrColumn(r.relationship_proof_ocr_data) : null)
+                || sel.ocr?.rel_proof || null;
+
+    addPair(nameBank, nameUser);
+
+    if (rt === "beneficiary") {
+      addPair(nameBank, benefName);
+    }
+
+    if (rt === "myself") {
+      addPair(coName, nameUser);
+      addPair(coName, nameBank);
+    }
+
+    if (isIndiv && idOCR?.full_name) {
+      const nameToCheck = rt==="myself" ? (coName||nameUser) : (recipName||nameUser);
+      addPair(idOCR.full_name, nameToCheck);
+      addPair(idOCR.full_name, benefName);
+    }
+
+    if (isOrg) {
+      const panNameCol  = (r.pan_name||"").trim();
+      const panNameToUse = idOCR?.full_name || panNameCol;
+      addPair(panNameToUse, recipName);
+    }
+
+    if (rt === "ngo") {
+      const cNGO = (r.campaign_ngo_name||"").trim();
+      addPair(cNGO, recipName);
+    }
+
+    if (REL_REQ.includes(rt) && relOCR?.names_found) {
+      const names = relOCR.names_found || [];
+      const hasBenef = benefName && names.some(n => fuzzyNameMatch(n, benefName));
+      if (!hasBenef && benefName) {
+        names.forEach(n => addPair(n, benefName));
+      }
+      const hasRecip = recipName && names.some(n => fuzzyNameMatch(n, recipName));
+      if (!hasRecip && recipName) {
+        names.forEach(n => addPair(n, recipName));
+      }
+    }
+
+    pairsToVerify.forEach(([a, b]) => {
+      const key = `${a}||${b}`;
+      setLlmCache(prev => ({
+        ...prev,
+        [key]: { loading: true, match: false, reason: "Checking with AI..." }
+      }));
+
+      verifyNameWithClaude(a, b).then(res => {
+        setLlmCache(prev => {
+          const next = {
+            ...prev,
+            [key]: { loading: false, match: res.match, reason: res.reason }
+          };
+          
+          if (res.match) {
+            const updatedOcr = ocrStore[selected] || {};
+            const { decision: newDecision, checks: newChecks } = runKYC(r, updatedOcr, next);
+            if (newDecision !== sel.decision) {
+              updateCaseInSupabase(r, newDecision, newChecks);
+            }
+          }
+          return next;
+        });
+      });
+    });
+
+  }, [selected, cases]);
 
   const summary = {
     APPROVE: processed.filter(c=>c.decision==="APPROVE").length,
@@ -681,7 +1148,14 @@ export default function KYCEngine() {
   return (
     <div style={{ display:"flex", flexDirection:"column", height:"100vh", background:"#050c1a", color:"#e2e8f0", fontFamily:"'DM Mono','Courier New',monospace" }}>
 
-      {/* ── Top bar ── */}
+      {dbError && (
+        <div style={{ background: "#2a1515", borderBottom: "1px solid #7a1515", color: "#f87171", padding: "10px 20px", fontSize: 11, display: "flex", justifyContent: "space-between", alignItems: "center", zIndex: 100, flexShrink: 0 }}>
+          <span>âš ï¸ <strong>Database Sync Issue:</strong> {dbError}</span>
+          <button onClick={() => setDbError(null)} style={{ background: "transparent", border: "none", color: "#f87171", cursor: "pointer", fontSize: 14, fontWeight: "bold", padding: "0 5px" }}>Ã—</button>
+        </div>
+      )}
+
+      {/* â”€â”€ Top bar â”€â”€ */}
       <div style={{ height:50, padding:"0 20px", display:"flex", alignItems:"center", justifyContent:"space-between", borderBottom:"1px solid #0d1829", background:"#060d1e", flexShrink:0 }}>
         <div style={{ display:"flex", alignItems:"center", gap:10 }}>
           <div style={{ width:26, height:26, borderRadius:6, background:"linear-gradient(135deg,#6366f1,#8b5cf6)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, fontWeight:900, color:"#fff" }}>K</div>
@@ -695,17 +1169,17 @@ export default function KYCEngine() {
             ))}
           </div>
           {isBatchRunning
-            ? <button onClick={pauseChecks} style={{ background:"#1c1506", border:"1px solid #78350f", color:"#fbbf24", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>⏸ Pause</button>
-            : <button onClick={runAllChecks} disabled={cases.length===0} style={{ background:"#0c1e38", border:"1px solid #1a3560", color:cases.length===0?"#1e2d45":"#60a5fa", padding:"4px 12px", borderRadius:4, cursor:cases.length===0?"not-allowed":"pointer", fontSize:11, fontFamily:"monospace" }}>▶ Run Checks</button>
+            ? <button onClick={pauseChecks} style={{ background:"#1c1506", border:"1px solid #78350f", color:"#fbbf24", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>â¸ Pause</button>
+            : <button onClick={runAllChecks} disabled={cases.length===0} style={{ background:"#0c1e38", border:"1px solid #1a3560", color:cases.length===0?"#1e2d45":"#60a5fa", padding:"4px 12px", borderRadius:4, cursor:cases.length===0?"not-allowed":"pointer", fontSize:11, fontFamily:"monospace" }}>â–¶ Run Checks</button>
           }
           <button onClick={downloadSample} style={{ background:"#0e1e30", border:"1px solid #1a2d45", color:"#64748b", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
-            ↓ Sample CSV
+            â†“ Sample CSV
           </button>
           <button onClick={exportCSV} style={{ background:"#0e1e30", border:"1px solid #1a2d45", color:"#94a3b8", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
-            ↓ Export Results
+            â†“ Export Results
           </button>
           <button onClick={()=>fileRef.current?.click()} style={{ background:"#0f1e38", border:"1px solid #1e3a6e", color:"#818cf8", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
-            ↑ Upload CSV
+            â†‘ Upload CSV
           </button>
           <input ref={fileRef} type="file" accept=".csv" style={{ display:"none" }} onChange={e=>handleFile(e.target.files[0])} />
         </div>
@@ -713,7 +1187,7 @@ export default function KYCEngine() {
 
       <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
 
-        {/* ── Sidebar ── */}
+        {/* â”€â”€ Sidebar â”€â”€ */}
         <div style={{ width:295, flexShrink:0, borderRight:"1px solid #0d1829", display:"flex", flexDirection:"column", background:"#040b18" }}
           onDragOver={e=>{e.preventDefault();setIsDrag(true);}}
           onDragLeave={()=>setIsDrag(false)}
@@ -736,7 +1210,7 @@ export default function KYCEngine() {
             ))}
             {cases.length===0 && (
               <div style={{ padding:32, textAlign:"center" }}>
-                <div style={{ fontSize:22, marginBottom:10 }}>📂</div>
+                <div style={{ fontSize:22, marginBottom:10 }}>ðŸ“‚</div>
                 <div style={{ fontSize:11, color:"#1e2d45", lineHeight:1.7 }}>No cases loaded.<br/>Upload a CSV to begin.</div>
               </div>
             )}
@@ -749,7 +1223,7 @@ export default function KYCEngine() {
           </div>
         </div>
 
-        {/* ── Detail Panel ── */}
+        {/* â”€â”€ Detail Panel â”€â”€ */}
         {selRow ? (
           <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
 
@@ -761,15 +1235,15 @@ export default function KYCEngine() {
                     {selRow.row.campaign_name||selRow.row.campaign||"Campaign"}
                   </div>
                   <div style={{ fontSize:10.5, color:"#334155" }}>
-                    {[selRow.row.category, selRow.row.recipient_type, selRow.row.currency||"INR"].filter(Boolean).join(" · ")}
+                    {[selRow.row.category, selRow.row.recipient_type, selRow.row.currency||"INR"].filter(Boolean).join(" Â· ")}
                   </div>
                 </div>
                 <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6 }}>
                   <DPill decision={selRow.decision} large />
                   <div style={{ fontSize:10, color:"#334155", fontFamily:"monospace" }}>
-                    {selRow.checks.filter(c=>c.status==="pass").length}✓&nbsp;
-                    {selRow.checks.filter(c=>c.status==="reject").length}✗&nbsp;
-                    {selRow.checks.filter(c=>c.status==="hold").length}◐
+                    {selRow.checks.filter(c=>c.status==="pass").length}âœ“&nbsp;
+                    {selRow.checks.filter(c=>c.status==="reject").length}âœ—&nbsp;
+                    {selRow.checks.filter(c=>c.status==="hold").length}â—
                   </div>
                 </div>
               </div>
@@ -814,7 +1288,7 @@ export default function KYCEngine() {
         ) : (
           <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1e2d45", fontSize:12, gap:10 }}>
             {cases.length===0
-              ? <><div style={{ fontSize:32 }}>⬆</div><div style={{ fontSize:13, color:"#2d3a50" }}>Upload a CSV to get started</div><div style={{ fontSize:11, color:"#1e2d45", marginTop:4 }}>Click "Upload CSV" in the top right</div></>
+              ? <><div style={{ fontSize:32 }}>â¬†</div><div style={{ fontSize:13, color:"#2d3a50" }}>Upload a CSV to get started</div><div style={{ fontSize:11, color:"#1e2d45", marginTop:4 }}>Click "Upload CSV" in the top right</div></>
               : <div>Select a case from the list</div>
             }
           </div>
